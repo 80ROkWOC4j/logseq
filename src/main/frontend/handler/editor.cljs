@@ -2517,6 +2517,13 @@
     (let [input-id (state/get-edit-input-id)
           input (state/get-input)
           key (gobj/get e "key")
+          strict-composing? (util/goog-event-is-composing? e)
+          process-composing? (util/goog-event-is-composing? e true)
+          autopair-trigger? (or (contains? (-> (keys autopair-map)
+                                               set
+                                               (conj "(" "`"))
+                                           key)
+                                (autopair-left-paren? input key))
           value (gobj/get input "value")
           ctrlKey (gobj/get e "ctrlKey")
           metaKey (gobj/get e "metaKey")
@@ -2546,7 +2553,9 @@
         (contains? #{"ArrowLeft" "ArrowRight"} key)
         (state/clear-editor-action!)
 
-        (and (util/goog-event-is-composing? e true) ;; #3218
+        (and (or strict-composing?
+                 (and process-composing?
+                      (not autopair-trigger?))) ;; #3218
              (not hashtag?) ;; #3283 @Rime
              (not (state/get-editor-show-page-search-hashtag?))) ;; #3283 @MacOS pinyin
         nil
