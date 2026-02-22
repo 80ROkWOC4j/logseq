@@ -1712,10 +1712,38 @@
                                           :logseq.property.asset/resize-metadata
                                           size)))
 
+(declare ime-post-autopair-close-char)
+(declare event-input-data-char)
+(declare ime-post-autopair-map)
+(declare recover-ime-input-char!)
+(declare ime-handle-backtick-existing-close!)
+
 (defn edit-box-on-change!
   [e block id]
   (when (= (:db/id block) (:db/id (state/get-edit-block)))
-    (let [value (util/evalue e)
+    (let [input (gdom/getElement id)
+          input-type (some-> e (.-nativeEvent) (.-inputType))
+          e-type (gobj/get e "type")
+          data-char (event-input-data-char e)
+          _ (when (and input data-char)
+              (recover-ime-input-char! id input data-char))
+          skipped-existing-backtick-close?
+          (when (and input (= data-char "`"))
+            (ime-handle-backtick-existing-close! id input))
+          current-pos (when input (cursor/pos input))
+          try-ime-post-autopair?
+          (or (= e-type "compositionend")
+              (contains? #{"insertText" "insertCompositionText" "insertFromComposition"} input-type)
+              (contains? ime-post-autopair-map data-char))
+          _ (when (and (not skipped-existing-backtick-close?)
+                       try-ime-post-autopair?
+                       input
+                       current-pos)
+              (when-let [close-char (ime-post-autopair-close-char input current-pos true data-char)]
+                (commands/simple-insert! id close-char {:backward-pos 1})))
+          value (if input
+                  (gobj/get input "value")
+                  (util/evalue e))
           repo (state/get-current-repo)]
       (state/set-edit-content! id value false)
       (clear-block-auto-save-timeout!)
@@ -2510,15 +2538,164 @@
          (not= (nth value pos) sym)
          true)))
 
+(def ^:private process-keycode->autopair-key
+  {["Backquote" false] "`"
+   ["Backquote" true] "~"
+   ["BracketLeft" false] "["
+   ["BracketLeft" true] "{"
+   ["Digit9" true] "("
+   ["Digit8" true] "*"
+   ["Digit6" true] "^"
+   ["Minus" true] "_"
+   ["Equal" false] "="
+   ["Equal" true] "+"
+   ["Slash" false] "/"})
+
+(def ^:private ime-post-autopair-map
+  {"`" "`"
+   "[" "]"
+   "{" "}"
+   "(" ")"})
+
+;; Keep a stable marker to verify cljs watch output actually contains this patch.
+(def ^:private ime-patch-build-id "IME_PATCH_20260222_v4")
+
+(defn- keydown-native-event
+  [^js e]
+  (when (util/goog-event? e)
+    (.getBrowserEvent e)))
+
+(defn- event-type
+  [^js e]
+  (or (gobj/get e "type")
+      (some-> e (.-nativeEvent) (.-type))))
+
+(defn- event-input-data-char
+  [^js e]
+  (let [data (or (some-> e (.-nativeEvent) (.-data))
+                 (gobj/get e "data"))]
+    (when (and (string? data) (= 1 (count data)))
+      data)))
+
+(defn- editor-ime-active?
+  [^js e]
+  (let [_ ime-patch-build-id]
+    (or (state/editor-in-composition?)
+      (util/goog-event-is-composing? e true)
+      (util/native-event-is-composing? e)
+      (contains? #{"compositionstart" "compositionupdate"} (event-type e)))))
+
+(defn- keydown-event-code
+  [^js e]
+  (or (some-> (keydown-native-event e) (.-code))
+      (gobj/get e "code")
+      (gobj/getValueByKeys e "event_" "code")))
+
+(defn- keydown-shift?
+  [^js e]
+  (boolean
+   (or (some-> (keydown-native-event e) (.-shiftKey))
+       (gobj/get e "shiftKey"))))
+
+(defn- keydown-process?
+  [^js e]
+  (or (= (gobj/get e "key") "Process")
+      (= (gobj/get e "keyCode") 229)
+      (editor-ime-active? e)))
+
+(defn- normalize-keydown-key
+  [^js e]
+  (let [key (gobj/get e "key")]
+    ;; Windows IME can emit Process/229 during composition for punctuation keys.
+    ;; Recover autopair-able characters from physical key code when possible.
+    (if (keydown-process? e)
+      (or (get process-keycode->autopair-key
+               [(keydown-event-code e)
+                (keydown-shift? e)])
+          key)
+      key)))
+
+(defn- ime-post-autopair-left-paren?
+  [value pos]
+  (let [prev (util/nth-safe value (- pos 2))]
+    (or (= pos 1)
+        (= prev "\n")
+        (= prev " ")
+        (= prev "]")
+        (= prev "("))))
+
+(defn- ime-input-char-missing?
+  [value current-pos data-char]
+  (let [left (util/nth-safe value (dec current-pos))]
+    (and (contains? ime-post-autopair-map data-char)
+         (not= left data-char))))
+
+(defn- recover-ime-input-char!
+  [id input data-char]
+  (let [current-pos (cursor/pos input)
+        value (gobj/get input "value")]
+    (when (ime-input-char-missing? value current-pos data-char)
+      ;; Recover the opening char first, then close-char fallback can add the pair.
+      (commands/simple-insert! id data-char nil)
+      true)))
+
+(defn- ime-handle-backtick-existing-close!
+  [id input]
+  (let [current-pos (cursor/pos input)
+        value (gobj/get input "value")
+        left (util/nth-safe value (dec current-pos))
+        right (util/nth-safe value current-pos)
+        prev (util/nth-safe value (- current-pos 2))]
+    ;; If this backtick should close an existing backtick pair,
+    ;; undo the IME-inserted char and move cursor over the existing close char.
+    (when (and (> current-pos 1)
+               (= left "`")
+               (= right "`")
+               (not= prev "`"))
+      (let [prefix (subs value 0 (dec current-pos))
+            suffix (subs value current-pos)
+            new-value (str prefix suffix)
+            new-pos current-pos]
+        (state/set-block-content-and-last-pos! id new-value new-pos)
+        (cursor/move-cursor-to input new-pos)
+        true))))
+
+(defn- ime-post-autopair-close-char
+  ([input current-pos is-processed?]
+   (ime-post-autopair-close-char input current-pos is-processed? nil))
+  ([input current-pos is-processed? inserted-char]
+   (when (and is-processed?
+              input
+              (not (state/get-editor-action))
+              (string/blank? (util/get-selected-text)))
+     (let [value (gobj/get input "value")
+           left (or inserted-char (util/nth-safe value (dec current-pos)))
+           right (util/nth-safe value current-pos)
+           prev (util/nth-safe value (- current-pos 2))
+           close-char (get ime-post-autopair-map left)]
+       (when (and close-char
+                  (or (not= right close-char)
+                      ;; typing several backticks should keep generating pairs (```)
+                      (and (= left "`")
+                           (= right "`")
+                           ;; Some IMEs omit InputEvent.data on repeated commits.
+                           (or (= inserted-char "`")
+                               (nil? inserted-char))
+                           (or (= prev "`")
+                               (= current-pos 1))))
+                  (if (= left "(")
+                    (ime-post-autopair-left-paren? value current-pos)
+                    true))
+         close-char)))))
+
 (defn ^:large-vars/cleanup-todo keydown-not-matched-handler
   "NOTE: Keydown cannot be used on Android platform"
   [format]
   (fn [e _key-code]
     (let [input-id (state/get-edit-input-id)
           input (state/get-input)
-          key (gobj/get e "key")
-          strict-composing? (util/goog-event-is-composing? e)
-          process-composing? (util/goog-event-is-composing? e true)
+          key (normalize-keydown-key e)
+          process-composing? (editor-ime-active? e)
           autopair-trigger? (or (contains? (-> (keys autopair-map)
                                                set
                                                (conj "(" "`"))
@@ -2553,9 +2730,9 @@
         (contains? #{"ArrowLeft" "ArrowRight"} key)
         (state/clear-editor-action!)
 
-        (and (or strict-composing?
-                 (and process-composing?
-                      (not autopair-trigger?))) ;; #3218
+        ;; Always ignore keydown during IME composition.
+        ;; IME punctuation autopair is handled in on-change fallback.
+        (and process-composing? ;; #3218
              (not hashtag?) ;; #3283 @Rime
              (not (state/get-editor-show-page-search-hashtag?))) ;; #3283 @MacOS pinyin
         nil
@@ -2688,34 +2865,38 @@
 (defn keyup-handler
   [_state input]
   (fn [e key-code]
-    (when-not (util/goog-event-is-composing? e)
-      (let [current-pos (cursor/pos input)
-            value (gobj/get input "value")
-            c (util/nth-safe value (dec current-pos))
-            [key-code k code is-processed?]
-            (if (and c
-                     (mobile-util/native-android?)
-                     (or (= key-code 229)
-                         (= key-code 0)))
-              [(.charCodeAt value (dec current-pos))
-               c
-               (cond
-                 (= c " ")
-                 "Space"
+    (let [strict-composing? (util/goog-event-is-composing? e)
+          current-pos (cursor/pos input)
+          value-before (gobj/get input "value")
+          c (util/nth-safe value-before (dec current-pos))
+          [key-code k code is-processed?]
+          (if (and c
+                   (mobile-util/native-android?)
+                   (or (= key-code 229)
+                       (= key-code 0)))
+            [(.charCodeAt value-before (dec current-pos))
+             c
+             (cond
+               (= c " ")
+               "Space"
 
-                 (parse-long c)
-                 (str "Digit" c)
+               (parse-long c)
+               (str "Digit" c)
 
-                 :else
-                 (str "Key" (string/upper-case c)))
-               false]
-              [key-code
+               :else
+               (str "Key" (string/upper-case c)))
+             false]
+            [key-code
+             (gobj/get e "key")
+             (if (mobile-util/native-android?)
                (gobj/get e "key")
-               (if (mobile-util/native-android?)
-                 (gobj/get e "key")
-                 (gobj/getValueByKeys e "event_" "code"))
-                ;; #3440
-               (util/goog-event-is-composing? e true)])]
+               (gobj/getValueByKeys e "event_" "code"))
+             ;; #3440
+             (editor-ime-active? e)])
+          _ (when-let [close-char (ime-post-autopair-close-char input current-pos is-processed?)]
+              (commands/simple-insert! (.-id input) close-char {:backward-pos 1}))
+          value (gobj/get input "value")]
+      (when-not strict-composing?
         (cond
           (= value "``````") ; turn this block into a code block
           (do

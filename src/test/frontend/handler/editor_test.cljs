@@ -1,10 +1,12 @@
 (ns frontend.handler.editor-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [frontend.commands :as commands]
             [frontend.db :as db]
             [frontend.db.model :as model]
             [frontend.handler.editor :as editor]
             [frontend.state :as state]
             [frontend.test.helper :as test-helper]
+            [frontend.util :as util]
             [frontend.util.cursor :as cursor]))
 
 (use-fixtures :each test-helper/start-and-destroy-db)
@@ -48,6 +50,207 @@
          (editor/extract-nearest-link-from-text
           "[[https://github.com/logseq/logseq][logseq]] is #awesome :)" 0 editor/url-regex))
       "Finds url in org link correctly"))
+
+(deftest normalize-keydown-key-test
+  (testing "IME Process key is normalized for autopair chars"
+    (is (= "("
+           (#'editor/normalize-keydown-key
+            #js {:key "Process"
+                 :shiftKey true
+                 :event_ #js {:code "Digit9"}})))
+
+    (is (= "`"
+           (#'editor/normalize-keydown-key
+            #js {:key "Process"
+                 :shiftKey false
+                 :event_ #js {:code "Backquote"}})))
+
+    (is (= "["
+           (#'editor/normalize-keydown-key
+            #js {:key "Process"
+                 :shiftKey false
+                 :event_ #js {:code "BracketLeft"}}))))
+
+  (testing "IME key can be normalized via native goog browser event"
+    (is (= "("
+           (#'editor/normalize-keydown-key
+            #js {:key "Unidentified"
+                 :keyCode 229
+                 :getBrowserEvent (fn []
+                                    #js {:code "Digit9"
+                                         :shiftKey true
+                                         :isComposing false})}))))
+
+  (testing "Unknown Process key remains unchanged"
+    (is (= "Process"
+           (#'editor/normalize-keydown-key
+            #js {:key "Process"
+                 :shiftKey false
+                 :event_ #js {:code "KeyA"}}))))
+
+  (testing "Non-Process key is unchanged"
+    (is (= "("
+           (#'editor/normalize-keydown-key
+            #js {:key "("
+                 :shiftKey true
+                 :event_ #js {:code "Digit9"}})))))
+
+(deftest editor-ime-active-test
+  (testing "Uses editor composition state"
+    (with-redefs [state/editor-in-composition? (constantly true)]
+      (is (true? (#'editor/editor-ime-active? #js {})))))
+
+  (testing "Detects composition events and process keys"
+    (with-redefs [state/editor-in-composition? (constantly false)]
+      (is (true? (#'editor/editor-ime-active? #js {:type "compositionstart"})))
+      (is (true? (#'editor/editor-ime-active? #js {:key "Process"})))
+      (is (true? (#'editor/editor-ime-active? #js {:keyCode 229})))
+      (is (false? (#'editor/editor-ime-active? #js {:type "keyup"
+                                                    :key "a"
+                                                    :keyCode 65}))))))
+
+(deftest ime-post-autopair-close-char-test
+  (with-redefs [state/get-editor-action (constantly nil)
+                util/get-selected-text (constantly "")]
+    (testing "Adds closing char for IME processed backtick"
+      (is (= "`"
+             (#'editor/ime-post-autopair-close-char
+              #js {:value "`"}
+              1
+              true))))
+
+    (testing "Adds closing paren only in allowed contexts"
+      (is (= ")"
+             (#'editor/ime-post-autopair-close-char
+              #js {:value " ("}
+              2
+              true)))
+      (is (nil?
+           (#'editor/ime-post-autopair-close-char
+            #js {:value "a("}
+            2
+            true))))
+
+    (testing "Skips when already closed or not IME processed"
+      (is (nil?
+           (#'editor/ime-post-autopair-close-char
+            #js {:value "()"}
+            1
+            true)))
+      (is (nil?
+           (#'editor/ime-post-autopair-close-char
+            #js {:value "`"}
+            1
+            false)))))
+
+    (testing "Uses inserted char hint from input event data"
+      (is (= "`"
+             (#'editor/ime-post-autopair-close-char
+              #js {:value "`"}
+              1
+              true
+              "`"))))
+
+    (testing "Backtick can keep generating pairs for IME sequence"
+      (is (= "`"
+             (#'editor/ime-post-autopair-close-char
+              #js {:value "```"}
+              2
+              true
+              "`"))))
+
+    (testing "Backtick can keep generating pairs even without input data hint"
+      (is (= "`"
+             (#'editor/ime-post-autopair-close-char
+              #js {:value "```"}
+              2
+              true))))
+
+    (testing "Backtick can keep generating pairs at first pair boundary"
+      (is (= "`"
+             (#'editor/ime-post-autopair-close-char
+              #js {:value "```"}
+              1
+              true
+              "`"))))
+
+    (testing "Backtick first pair boundary also works without input data hint"
+      (is (= "`"
+             (#'editor/ime-post-autopair-close-char
+              #js {:value "```"}
+              1
+              true))))
+
+  (with-redefs [state/get-editor-action (constantly :page-search)
+                util/get-selected-text (constantly "")]
+    (testing "Skips when editor action is active"
+      (is (nil?
+           (#'editor/ime-post-autopair-close-char
+            #js {:value "["}
+            1
+            true))))))
+
+(deftest event-input-data-char-test
+  (is (= "`" (#'editor/event-input-data-char #js {:nativeEvent #js {:data "`"}})))
+  (is (= "(" (#'editor/event-input-data-char #js {:data "("})))
+  (is (nil? (#'editor/event-input-data-char #js {:nativeEvent #js {:data "ab"}})))
+  (is (nil? (#'editor/event-input-data-char #js {}))))
+
+(deftest recover-ime-input-char-test
+  (testing "Recover missing IME punctuation char"
+    (let [calls (atom [])]
+      (with-redefs [cursor/pos (constantly 0)
+                    commands/simple-insert! (fn [id value opts]
+                                              (swap! calls conj [id value opts]))]
+        (is (true? (#'editor/recover-ime-input-char! "id" #js {:value ""} "`")))
+        (is (= [["id" "`" nil]] @calls)))))
+
+  (testing "Do not recover when char already exists"
+    (let [calls (atom [])]
+      (with-redefs [cursor/pos (constantly 1)
+                    commands/simple-insert! (fn [id value opts]
+                                              (swap! calls conj [id value opts]))]
+        (is (nil? (#'editor/recover-ime-input-char! "id" #js {:value "`"} "`")))
+        (is (empty? @calls)))))
+
+  (testing "Do not recover for non-autopair chars"
+    (let [calls (atom [])]
+      (with-redefs [cursor/pos (constantly 0)
+                    commands/simple-insert! (fn [id value opts]
+                                              (swap! calls conj [id value opts]))]
+        (is (nil? (#'editor/recover-ime-input-char! "id" #js {:value ""} "a")))
+        (is (empty? @calls))))))
+
+(deftest ime-handle-backtick-existing-close-test
+  (testing "Consumes IME inserted backtick when closing existing pair"
+    (let [set-calls (atom [])
+          move-calls (atom [])]
+      (with-redefs [cursor/pos (constantly 3)
+                    state/set-block-content-and-last-pos! (fn [id value pos]
+                                                            (swap! set-calls conj [id value pos]))
+                    cursor/move-cursor-to (fn [_input pos]
+                                            (swap! move-calls conj pos))]
+        (is (true? (#'editor/ime-handle-backtick-existing-close! "id" #js {:value "`a``"})))
+        (is (= [["id" "`a`" 3]] @set-calls))
+        (is (= [3] @move-calls)))))
+
+  (testing "Does not consume when typing repeated backticks"
+    (let [set-calls (atom [])]
+      (with-redefs [cursor/pos (constantly 2)
+                    state/set-block-content-and-last-pos! (fn [id value pos]
+                                                            (swap! set-calls conj [id value pos]))
+                    cursor/move-cursor-to (fn [_input _pos] nil)]
+        (is (nil? (#'editor/ime-handle-backtick-existing-close! "id" #js {:value "```"})))
+        (is (empty? @set-calls))))))
+
+  (testing "Does not consume at first pair boundary"
+    (let [set-calls (atom [])]
+      (with-redefs [cursor/pos (constantly 1)
+                    state/set-block-content-and-last-pos! (fn [id value pos]
+                                                            (swap! set-calls conj [id value pos]))
+                    cursor/move-cursor-to (fn [_input _pos] nil)]
+        (is (nil? (#'editor/ime-handle-backtick-existing-close! "id" #js {:value "``"})))
+        (is (empty? @set-calls))))))
 
 (defn- keyup-handler
   "Spied version of editor/keyup-handler"
