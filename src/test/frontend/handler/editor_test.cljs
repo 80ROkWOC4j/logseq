@@ -1,13 +1,413 @@
 (ns frontend.handler.editor-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [frontend.commands :as commands]
             [frontend.db :as db]
             [frontend.db.model :as model]
             [frontend.handler.editor :as editor]
+            [frontend.handler.notification :as notification]
             [frontend.state :as state]
             [frontend.test.helper :as test-helper]
-            [frontend.util.cursor :as cursor]))
+            [frontend.util :as util]
+            [frontend.util.cursor :as cursor]
+            [goog.dom :as gdom]
+            [goog.object :as gobj]))
 
 (use-fixtures :each test-helper/start-and-destroy-db)
+
+(defn- sync-cursor!
+  [pos* input]
+  (let [pos @pos*]
+    (set! (.-selectionStart input) pos)
+    (set! (.-selectionEnd input) pos)))
+
+(defn- insert-text-at-cursor!
+  [value* pos* input text]
+  (let [pos @pos*
+        before (subs @value* 0 pos)
+        after (subs @value* pos)
+        next-value (str before text after)]
+    (reset! value* next-value)
+    (set! (.-value input) next-value)
+    (swap! pos* + (count text))
+    (sync-cursor! pos* input)))
+
+(defn- capture-autopair-side-effects!
+  [steps* warnings* action-data* pos selected prefix]
+  (cond
+    (= prefix "[[")
+    (do
+      (swap! steps* conj [:editor/search-page])
+      (reset! action-data* {:pos {:pos pos}
+                            :selected selected}))
+
+    (= prefix "((")
+    (do
+      (swap! steps* conj [:editor/search-block :reference])
+      (reset! action-data* {:pos {:pos pos}
+                            :selected selected}))
+
+    :else
+    nil))
+
+(defn- keydown-not-matched-handler
+  [{:keys [value cursor-pos event events input-char strict-composing? process-composing?]
+    :or {value ""
+         cursor-pos 0
+         strict-composing? false
+         process-composing? false}}]
+  (let [calls (atom [])
+        steps* (atom [])
+        warnings* (atom [])
+        action-data* (atom nil)
+        stopped? (atom false)
+        value* (atom value)
+        pos* (atom cursor-pos)
+        events* (or events (when event [event]))
+        input (js-obj "value" value
+                      "selectionStart" cursor-pos
+                      "selectionEnd" cursor-pos
+                      "getBoundingClientRect" (fn []
+                                                #js {:toJSON (fn []
+                                                               #js {:left 0
+                                                                    :top 0
+                                                                    :width 0
+                                                                    :height 0})}))]
+    (gobj/set input "setSelectionRange"
+              (fn [start end]
+                (set! (.-selectionStart input) start)
+                (set! (.-selectionEnd input) end)))
+    (state/set-editor-action! nil)
+    (with-redefs [state/get-edit-input-id (constantly "id")
+                  state/get-input (constantly input)
+                  gdom/getElement (constantly input)
+                  cursor/pos (fn [_] @pos*)
+                  cursor/move-cursor-forward (fn [_]
+                                               (swap! pos* inc)
+                                               (sync-cursor! pos* input))
+                  cursor/get-caret-pos (fn [_] {:pos @pos*})
+                  util/get-selected-text (constantly "")
+                  state/get-editor-show-page-search-hashtag? (constantly false)
+                  util/goog-event-is-composing?
+                  (fn [_e include-process?]
+                    (if include-process?
+                      process-composing?
+                      strict-composing?))
+                  commands/simple-insert!
+                  (fn [_id text {:keys [backward-pos]}]
+                    (insert-text-at-cursor! value* pos* input text)
+                    (swap! pos* - (or backward-pos 0))
+                    (sync-cursor! pos* input))
+                  util/stop (fn [_] (reset! stopped? true))
+                  editor/autopair
+                  (fn [input-id key format option]
+                    (swap! calls conj [input-id key format option])
+                    (let [close-char (get editor/autopair-map key)
+                          pos @pos*
+                          before (subs @value* 0 pos)
+                          after (subs @value* pos)
+                          next-value (str before key close-char after)]
+                      (reset! value* next-value)
+                      (set! (.-value input) next-value)
+                      (swap! pos* inc)
+                      (sync-cursor! pos* input)
+                      (when-let [prefix (#'editor/get-autopair-side-effect-prefix next-value (- @pos* 2))]
+                        (capture-autopair-side-effects! steps*
+                                                        warnings*
+                                                        action-data*
+                                                        @pos*
+                                                        ""
+                                                        prefix))))]
+      (doseq [event events*]
+        (reset! stopped? false)
+        (let [calls-before (count @calls)]
+          ((editor/keydown-not-matched-handler :markdown) event nil)
+          (when (and (= calls-before (count @calls))
+                     (string? input-char)
+                     (not @stopped?))
+            (insert-text-at-cursor! value* pos* input input-char))
+          ;; Keep repeat tests focused on autopair behavior, not popup state retention.
+          (state/clear-editor-action!)))
+      {:value @value*
+       :pos @pos*
+       :steps @steps*
+       :warnings @warnings*
+       :action-data @action-data*})))
+
+(defn- ime-composition-end-handler
+  [{:keys [value cursor-pos input-char repeat-count pre-commit?]
+    :or {value ""
+         cursor-pos 0
+         repeat-count 1
+         pre-commit? true}}]
+  (let [steps* (atom [])
+        warnings* (atom [])
+        action-data* (atom nil)
+        value* (atom value)
+        pos* (atom cursor-pos)
+        input (js-obj "value" value
+                      "selectionStart" cursor-pos
+                      "selectionEnd" cursor-pos
+                      "getBoundingClientRect" (fn []
+                                                #js {:toJSON (fn []
+                                                               #js {:left 0
+                                                                    :top 0
+                                                                    :width 0
+                                                                    :height 0})}))]
+    (gobj/set input "setSelectionRange"
+              (fn [start end]
+                (set! (.-selectionStart input) start)
+                (set! (.-selectionEnd input) end)))
+    (state/set-editor-action! nil)
+    (with-redefs [state/get-edit-input-id (constantly "id")
+                  state/get-input (constantly input)
+                  editor/ime-composition-start-context (atom {})
+                  gdom/getElement (constantly input)
+                  cursor/pos (fn [_] @pos*)
+                  cursor/get-caret-pos (fn [_] {:pos @pos*})
+                  cursor/move-cursor-to (fn
+                                          ([_input n]
+                                           (reset! pos* n)
+                                           (sync-cursor! pos* input))
+                                          ([_input n _delay?]
+                                           (reset! pos* n)
+                                           (sync-cursor! pos* input)))
+                  util/get-selected-text (constantly "")
+                  state/set-block-content-and-last-pos!
+                  (fn [_id value pos]
+                    (reset! value* value)
+                    (set! (.-value input) value)
+                    (reset! pos* pos)
+                    (sync-cursor! pos* input))
+                  commands/handle-step (fn [step] (swap! steps* conj step))
+                  notification/show! (fn [message level]
+                                       (swap! warnings* conj [message level]))
+                  state/set-editor-action-data! (fn [m] (reset! action-data* m))
+                  editor/schedule-ime-autopair! (fn [f] (f))
+                  commands/simple-insert!
+                  (fn [_id text {:keys [backward-pos]}]
+                    (insert-text-at-cursor! value* pos* input text)
+                    (swap! pos* - (or backward-pos 0))
+                    (sync-cursor! pos* input))]
+      (dotimes [_ repeat-count]
+        (#'editor/ime-composition-autopair! #js {:type "compositionstart"
+                                                 :data ""}
+         "id")
+        ;; Some IMEs commit the opener before compositionend, some do it after.
+        (when pre-commit?
+          (insert-text-at-cursor! value* pos* input input-char))
+        (#'editor/ime-composition-autopair! #js {:type "compositionend"
+                                                 :data input-char}
+         "id")
+        ;; Keep repeat tests focused on autopair behavior, not popup state retention.
+        (state/clear-editor-action!))
+      {:value @value*
+       :pos @pos*
+       :steps @steps*
+       :warnings @warnings*
+       :action-data @action-data*})))
+
+(defn- backspace-delete-pair-handler
+  [{:keys [value cursor-pos]
+    :or {value ""
+         cursor-pos 0}}]
+  (let [value* (atom value)
+        pos* (atom cursor-pos)
+        input #js {:id "id" :value value}
+        original-document (gobj/get js/globalThis "document")
+        fake-document #js {:activeElement input}]
+    (gobj/set js/globalThis "document" fake-document)
+    (try
+      (with-redefs [state/get-input (constantly input)
+                    state/get-edit-input-id (constantly "id")
+                    cursor/pos (fn [_] @pos*)
+                    util/get-selection-start (fn [_] @pos*)
+                    util/get-selection-end (fn [_] @pos*)
+                    state/get-current-repo (constantly nil)
+                    util/stop (fn [_] nil)
+                    state/get-editor-show-page-search? (constantly false)
+                    state/get-editor-show-block-search? (constantly false)
+                    commands/delete-pair!
+                    (fn [_id]
+                      (let [pos @pos*
+                            prefix (subs @value* 0 (dec pos))
+                            next-value (str prefix (subs @value* (inc pos)))]
+                        (reset! value* next-value)
+                        (set! (.-value input) next-value)
+                        (reset! pos* (count prefix))))]
+        (editor/keydown-backspace-handler false #js {})
+        {:value @value*
+         :pos @pos*})
+      (finally
+        (gobj/set js/globalThis "document" original-document)))))
+
+(def ime-autopair-cases
+  [["(" "(" "Digit9" true]
+   ["{" "{" "BracketLeft" true]
+   ["`" "`" "Backquote" false]
+   ["[" "[" "BracketLeft" false]])
+
+(defn- expected-paired-value
+  [input-char repeat-count]
+  (let [close-char (get editor/autopair-map input-char)]
+    (str (apply str (repeat repeat-count input-char))
+         (apply str (repeat repeat-count close-char)))))
+
+(defn- assert-ime-composition-autopair!
+  [repeat-count]
+  (doseq [[label english-key ime-code ime-shift] ime-autopair-cases]
+    (testing (str "Autopair should work in both english and IME modes for " label
+                  " repeated " repeat-count " times")
+      (let [expected (expected-paired-value label repeat-count)
+            english-event #js {:key english-key
+                               :code ime-code
+                               :shiftKey ime-shift}
+            english-result (keydown-not-matched-handler
+                            {:events (vec (repeat repeat-count english-event))
+                             :input-char label})
+            ime-result (ime-composition-end-handler
+                        {:input-char label
+                         :repeat-count repeat-count})
+            english-detail (str "repeat-count=" repeat-count
+                                "\nchar=" label
+                                "\nmode=english"
+                                "\nexpected-final=" expected
+                                "\nactual-final=" (pr-str (:value english-result)))
+            ime-detail (str "repeat-count=" repeat-count
+                            "\nchar=" label
+                            "\nmode=ime"
+                            "\nexpected-final=" expected
+                            "\nactual-final=" (pr-str (:value ime-result)))]
+        (is (= expected (:value english-result))
+            (str "English final editor value should be paired for " label "\n" english-detail))
+        (is (= expected (:value ime-result))
+            (str "IME final editor value should be paired for " label "\n" ime-detail))))))
+
+(deftest ime-composition-autopair-test
+  (doseq [repeat-count [1 2 3]]
+    (assert-ime-composition-autopair! repeat-count)))
+
+(deftest ime-composition-autopair-no-precommit-fallback-test
+  (doseq [[label english-key ime-code ime-shift] ime-autopair-cases]
+    (testing (str "Autopair should still work when compositionend happens before opener commit for " label)
+      (let [expected (expected-paired-value label 1)
+            english-event #js {:key english-key
+                               :code ime-code
+                               :shiftKey ime-shift}
+            english-result (keydown-not-matched-handler
+                            {:events [english-event]
+                             :input-char label})
+            ime-result (ime-composition-end-handler
+                        {:input-char label
+                         :repeat-count 1
+                         :pre-commit? false})
+            detail (str "char=" label
+                        "\nexpected-final=" expected
+                        "\nenglish-final=" (pr-str (:value english-result))
+                        "\nime-final=" (pr-str (:value ime-result)))]
+        (is (= expected (:value english-result))
+            (str "English final editor value should be paired for " label "\n" detail))
+        (is (= expected (:value ime-result))
+            (str "IME final editor value should be paired for " label "\n" detail))))))
+
+(deftest ime-composition-tilde-forward-parity-test
+  (doseq [[repeat-count expected] [[1 "~~"]
+                                   [2 "~~"]
+                                   [3 "~~~~"]]]
+    (testing (str "Tilde autopair should match english forward behavior, repeat-count=" repeat-count)
+      (let [events (vec (repeat repeat-count #js {:key "~"
+                                                  :code "Backquote"
+                                                  :shiftKey true}))
+            english (keydown-not-matched-handler {:events events
+                                                  :input-char "~"})
+            ime (ime-composition-end-handler {:input-char "~"
+                                              :repeat-count repeat-count})]
+        (is (= expected (:value english)))
+        (is (= expected (:value ime)))
+        (is (= (:value english) (:value ime)))))))
+
+(deftest ime-composition-autopair-backspace-delete-pair-test
+  (doseq [repeat-count [1 2 3]
+          [label english-key ime-code ime-shift] ime-autopair-cases]
+    (testing (str "Backspace should delete paired chars in both english and IME modes for "
+                  label " repeated " repeat-count " times")
+      (let [expected-before (expected-paired-value label repeat-count)
+            expected-after (if (= repeat-count 1)
+                             ""
+                             (expected-paired-value label (dec repeat-count)))
+            english-event #js {:key english-key
+                               :code ime-code
+                               :shiftKey ime-shift}
+            english-typed (keydown-not-matched-handler
+                           {:events (vec (repeat repeat-count english-event))
+                            :input-char label})
+            english-after-backspace (backspace-delete-pair-handler
+                                     {:value (:value english-typed)
+                                      :cursor-pos (:pos english-typed)})
+            ime-typed (ime-composition-end-handler
+                       {:input-char label
+                        :repeat-count repeat-count})
+            ime-after-backspace (backspace-delete-pair-handler
+                                 {:value (:value ime-typed)
+                                  :cursor-pos (:pos ime-typed)})
+            english-detail (str "repeat-count=" repeat-count
+                                "\nchar=" label
+                                "\nmode=english"
+                                "\nexpected-before=" expected-before
+                                "\nactual-before=" (pr-str (:value english-typed))
+                                "\nexpected-after=" expected-after
+                                "\nactual-after=" (pr-str (:value english-after-backspace)))
+            ime-detail (str "repeat-count=" repeat-count
+                            "\nchar=" label
+                            "\nmode=ime"
+                            "\nexpected-before=" expected-before
+                            "\nactual-before=" (pr-str (:value ime-typed))
+                            "\nexpected-after=" expected-after
+                            "\nactual-after=" (pr-str (:value ime-after-backspace)))]
+        (is (= expected-before (:value english-typed))
+            (str "English precondition should be paired before backspace for " label "\n" english-detail))
+        (is (= expected-before (:value ime-typed))
+            (str "IME precondition should be paired before backspace for " label "\n" ime-detail))
+        (is (= expected-after (:value english-after-backspace))
+            (str "English backspace should delete one pair for " label "\n" english-detail))
+        (is (= expected-after (:value ime-after-backspace))
+            (str "IME backspace should delete one pair for " label "\n" ime-detail))))))
+
+(deftest ime-composition-autopair-side-effects-test
+  (testing "[[ side effects should match between english and IME"
+    (let [english (keydown-not-matched-handler
+                   {:events [#js {:key "[" :code "BracketLeft" :shiftKey false}
+                             #js {:key "[" :code "BracketLeft" :shiftKey false}]
+                    :input-char "["})
+          ime (ime-composition-end-handler {:input-char "[" :repeat-count 2})]
+      (is (= (:steps english) (:steps ime)))
+      (is (= (:warnings english) (:warnings ime)))
+      (is (map? (:action-data english)))
+      (is (map? (:action-data ime)))))
+
+  (testing "(( side effects should match between english and IME"
+    (let [english (keydown-not-matched-handler
+                   {:events [#js {:key "(" :code "Digit9" :shiftKey true}
+                             #js {:key "(" :code "Digit9" :shiftKey true}]
+                    :input-char "("})
+          ime (ime-composition-end-handler {:input-char "(" :repeat-count 2})]
+      (is (= (:steps english) (:steps ime)))
+      (is (= (:warnings english) (:warnings ime)))
+      (is (= [[:editor/search-block :reference]] (:steps ime)))
+      (is (empty? (:warnings english)))
+      (is (empty? (:warnings ime)))
+      (is (map? (:action-data english)))
+      (is (map? (:action-data ime)))))
+
+  (testing "{{ should have no page/block side effects"
+    (let [english (keydown-not-matched-handler
+                   {:events [#js {:key "{" :code "BracketLeft" :shiftKey true}
+                             #js {:key "{" :code "BracketLeft" :shiftKey true}]
+                    :input-char "{"})
+          ime (ime-composition-end-handler {:input-char "{" :repeat-count 2})]
+      (is (empty? (:steps english)))
+      (is (empty? (:steps ime)))
+      (is (empty? (:warnings english)))
+      (is (empty? (:warnings ime))))))
 
 (deftest extract-nearest-link-from-text-test
   (testing "Page, block and tag links"
