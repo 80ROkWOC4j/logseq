@@ -126,6 +126,7 @@
  :linked-references/filter-includes "Includes: "
  :linked-references/filter-excludes "Excludes: "
  :editor/block-search "Search for a block"
+ :editor/node-reference-warning "To reference a node, please use `[[]]`."
  :text/image "Image"
  :asset/show-in-folder "Show image in folder"
  :asset/open-in-browser "Open image in browser"

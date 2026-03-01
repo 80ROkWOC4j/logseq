@@ -6,6 +6,7 @@
             [dommy.core :as dom]
             [frontend.commands :as commands]
             [frontend.config :as config]
+            [frontend.context.i18n :refer [t]]
             [frontend.date :as date]
             [frontend.db :as db]
             [frontend.db.async :as db-async]
@@ -1457,6 +1458,12 @@
          "$" "$"
          ":" ":"))
 
+(defn- show-node-reference-warning!
+  []
+  (notification/show!
+   (t :editor/node-reference-warning)
+   :warning))
+
 (defn- autopair
   [input-id prefix _format _option]
   (let [value (get autopair-map prefix)
@@ -1480,6 +1487,7 @@
 
           (= prefix block-ref/left-parens)
           (do
+            (show-node-reference-warning!)
             (commands/handle-step [:editor/search-block :reference])
             (state/set-editor-action-data! {:pos (cursor/get-caret-pos input)
                                             :selected selected})))))))
@@ -1624,6 +1632,7 @@
 
                            (= prefix block-ref/left-parens)
                            (do
+                             (show-node-reference-warning!)
                              (commands/handle-step [:editor/search-block :reference])
                              (state/set-editor-action-data! {:pos (cursor/get-caret-pos input)
                                                              :selected selected}))

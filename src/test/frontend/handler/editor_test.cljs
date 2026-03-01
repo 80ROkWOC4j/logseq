@@ -43,6 +43,7 @@
     (= prefix "((")
     (do
       (swap! steps* conj [:editor/search-block :reference])
+      (swap! warnings* conj [:warning])
       (reset! action-data* {:pos {:pos pos}
                             :selected selected}))
 
@@ -179,8 +180,8 @@
                     (reset! pos* pos)
                     (sync-cursor! pos* input))
                   commands/handle-step (fn [step] (swap! steps* conj step))
-                  notification/show! (fn [message level]
-                                       (swap! warnings* conj [message level]))
+                  notification/show! (fn [_message level]
+                                       (swap! warnings* conj [level]))
                   state/set-editor-action-data! (fn [m] (reset! action-data* m))
                   editor/schedule-ime-autopair! (fn [f] (f))
                   commands/simple-insert!
@@ -393,8 +394,10 @@
       (is (= (:steps english) (:steps ime)))
       (is (= (:warnings english) (:warnings ime)))
       (is (= [[:editor/search-block :reference]] (:steps ime)))
-      (is (empty? (:warnings english)))
-      (is (empty? (:warnings ime)))
+      (is (= 1 (count (:warnings english))))
+      (is (= 1 (count (:warnings ime))))
+      (is (= [:warning] (first (:warnings english))))
+      (is (= [:warning] (first (:warnings ime))))
       (is (map? (:action-data english)))
       (is (map? (:action-data ime)))))
 
