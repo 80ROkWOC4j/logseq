@@ -6,7 +6,6 @@
             [dommy.core :as dom]
             [frontend.commands :as commands]
             [frontend.config :as config]
-            [frontend.context.i18n :refer [t]]
             [frontend.date :as date]
             [frontend.db :as db]
             [frontend.db.async :as db-async]
@@ -1467,7 +1466,7 @@
 (defn- show-node-reference-warning!
   []
   (notification/show!
-   (t :editor/node-reference-warning)
+   "To reference a node, please use `[[]]`."
    :warning))
 
 (defn- run-autopair-side-effects!
