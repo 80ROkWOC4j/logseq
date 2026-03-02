@@ -1,5 +1,6 @@
 (ns frontend.handler.editor-test
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.string :as string]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [frontend.commands :as commands]
             [frontend.db :as db]
             [frontend.db.model :as model]
@@ -241,11 +242,223 @@
       (finally
         (gobj/set js/globalThis "document" original-document)))))
 
+(defn- english-autopair-with-selected-text-handler
+  [{:keys [value selected-text selection-start key code shift-key repeat-count]
+    :or {value "Test"
+         selected-text "Test"
+         selection-start 0
+         key "*"
+         code "Digit8"
+         shift-key true
+         repeat-count 1}}]
+  (let [calls (atom [])
+        steps* (atom [])
+        warnings* (atom [])
+        action-data* (atom nil)
+        stopped? (atom false)
+        value* (atom value)
+        pos* (atom selection-start)
+        input (js-obj "value" value
+                      "selectionStart" selection-start
+                      "selectionEnd" (+ selection-start (count selected-text)))]
+    (gobj/set input "setSelectionRange"
+              (fn [start end]
+                (set! (.-selectionStart input) start)
+                (set! (.-selectionEnd input) end)))
+    (state/set-editor-action! nil)
+    (with-redefs [state/get-edit-input-id (constantly "id")
+                  state/get-input (constantly input)
+                  gdom/getElement (constantly input)
+                  cursor/pos (fn [_] @pos*)
+                  util/get-selected-text
+                  (fn []
+                    (let [start (.-selectionStart input)
+                          end (.-selectionEnd input)]
+                      (if (and (number? start)
+                               (number? end)
+                               (not= start end))
+                        (subs @value* start end)
+                        "")))
+                  state/get-editor-show-page-search-hashtag? (constantly false)
+                  util/goog-event-is-composing? (constantly false)
+                  util/stop (fn [_] (reset! stopped? true))
+                  editor/autopair
+                  (fn [_id k _format _option]
+                    (swap! calls conj k)
+                    (let [selected (util/get-selected-text)
+                          close-char (get editor/autopair-map k)
+                          insert-value (str k selected close-char)
+                          current-pos @pos*
+                          prefix (subs @value* 0 current-pos)
+                          suffix (subs @value* current-pos)
+                          postfix (if (string/blank? selected)
+                                    suffix
+                                    (string/replace-first suffix selected ""))
+                          next-value (str prefix insert-value postfix)
+                          next-pos (inc (count prefix))
+                          prefix-pos (dec (count prefix))]
+                      (reset! value* next-value)
+                      (set! (.-value input) next-value)
+                      (reset! pos* next-pos)
+                      (.setSelectionRange input next-pos (+ next-pos (count selected)))
+                      (when (and (>= prefix-pos 0)
+                                 (<= (+ prefix-pos 2) (count next-value)))
+                        (capture-autopair-side-effects!
+                         steps*
+                         warnings*
+                         action-data*
+                         @pos*
+                         selected
+                         (subs next-value prefix-pos (+ prefix-pos 2))))))]
+      (dotimes [_ repeat-count]
+        (reset! stopped? false)
+        (let [calls-before (count @calls)]
+          ((editor/keydown-not-matched-handler :markdown)
+           #js {:key key
+                :code code
+                :shiftKey shift-key}
+           nil)
+          (when (and (= calls-before (count @calls))
+                     (not @stopped?))
+            ;; If autopair doesn't run, typed text replaces current selection.
+            (let [start (.-selectionStart input)
+                  end (.-selectionEnd input)
+                  before (subs @value* 0 start)
+                  after (subs @value* end)
+                  next-value (str before key after)
+                  next-pos (+ start (count key))]
+              (reset! value* next-value)
+              (set! (.-value input) next-value)
+              (reset! pos* next-pos)
+              (.setSelectionRange input next-pos next-pos))))
+        ;; Keep repeat tests focused on autopair behavior, not popup state retention.
+        (state/clear-editor-action!))
+      {:value @value*
+       :calls @calls
+       :steps @steps*
+       :warnings @warnings*
+       :action-data @action-data*})))
+
+(defn- ime-autopair-with-selected-text-handler
+  [{:keys [value selected-text selection-start input-char code shift-key repeat-count]
+    :or {value "Test"
+         selected-text "Test"
+         selection-start 0
+         input-char "*"
+         code "Digit8"
+         shift-key true
+         repeat-count 1}}]
+  (let [value* (atom value)
+        pos* (atom selection-start)
+        steps* (atom [])
+        warnings* (atom [])
+        action-data* (atom nil)
+        simple-insert-calls* (atom 0)
+        input (js-obj "value" value
+                      "selectionStart" selection-start
+                      "selectionEnd" (+ selection-start (count selected-text)))]
+    (gobj/set input "setSelectionRange"
+              (fn [start end]
+                (set! (.-selectionStart input) start)
+                (set! (.-selectionEnd input) end)))
+    (state/set-editor-action! nil)
+    (with-redefs [state/get-edit-input-id (constantly "id")
+                  state/get-input (constantly input)
+                  gdom/getElement (constantly input)
+                  editor/ime-composition-start-context (atom {})
+                  cursor/pos (fn [_] @pos*)
+                  cursor/get-caret-pos (fn [_] {:pos @pos*})
+                  cursor/move-cursor-to (fn
+                                          ([_input n]
+                                           (reset! pos* n)
+                                           (.setSelectionRange input n n))
+                                          ([_input n _delay?]
+                                           (reset! pos* n)
+                                           (.setSelectionRange input n n)))
+                  util/get-selected-text
+                  (fn []
+                    (let [start (.-selectionStart input)
+                          end (.-selectionEnd input)]
+                      (if (and (number? start)
+                               (number? end)
+                               (not= start end))
+                        (subs @value* start end)
+                        "")))
+                  util/goog-event-is-composing? (fn [_e include-process?]
+                                                  include-process?)
+                  state/get-editor-show-page-search-hashtag? (constantly false)
+                  commands/handle-step (fn [step] (swap! steps* conj step))
+                  notification/show! (fn [_message level]
+                                       (swap! warnings* conj [level]))
+                  state/set-editor-action-data! (fn [m] (reset! action-data* m))
+                  state/set-block-content-and-last-pos!
+                  (fn [_id next-value next-pos]
+                    (reset! value* next-value)
+                    (set! (.-value input) next-value)
+                    (reset! pos* next-pos)
+                    (.setSelectionRange input next-pos next-pos))
+                  editor/schedule-ime-autopair! (fn [f] (f))
+                  commands/simple-insert!
+                  (fn [_id text {:keys [backward-pos]}]
+                    (swap! simple-insert-calls* inc)
+                    (let [before (subs @value* 0 @pos*)
+                          after (subs @value* @pos*)
+                          next-value (str before text after)
+                          next-pos (- (+ @pos* (count text))
+                                      (or backward-pos 0))]
+                      (reset! value* next-value)
+                      (set! (.-value input) next-value)
+                      (reset! pos* next-pos)
+                      (.setSelectionRange input next-pos next-pos)))]
+      (dotimes [_ repeat-count]
+        ;; Real app path: keydown(Process) during IME stores selection context.
+        ((editor/keydown-not-matched-handler :markdown)
+         #js {:key "Process"
+              :code code
+              :shiftKey shift-key}
+         nil)
+        ;; Simulate IME pre-commit replacing selected range with a single opener.
+        (let [start (.-selectionStart input)
+              end (.-selectionEnd input)
+              before (subs @value* 0 start)
+              after (subs @value* end)
+              next-value (str before input-char after)
+              next-pos (+ start (count input-char))]
+          (reset! value* next-value)
+          (set! (.-value input) next-value)
+          (reset! pos* next-pos)
+          (.setSelectionRange input next-pos next-pos))
+        (#'editor/ime-composition-autopair! #js {:type "compositionend"
+                                                 :data input-char}
+         "id")
+        ;; Keep repeat tests focused on autopair behavior, not popup state retention.
+        (state/clear-editor-action!))
+      {:value @value*
+       :simple-insert-calls @simple-insert-calls*
+       :steps @steps*
+       :warnings @warnings*
+       :action-data @action-data*})))
+
 (def ime-autopair-cases
   [["(" "(" "Digit9" true]
    ["{" "{" "BracketLeft" true]
    ["`" "`" "Backquote" false]
    ["[" "[" "BracketLeft" false]])
+
+(def ime-selected-text-wrapping-cases
+  [["*" "Digit8" true]
+   ["+" "Equal" true]
+   ["_" "Minus" true]
+   ["=" "Equal" false]
+   ["^" "Digit6" true]
+   ["/" "Slash" false]])
+
+(def ime-selected-text-opener-cases
+  [["(" "Digit9" true]
+   ["[" "BracketLeft" false]
+   ["{" "BracketLeft" true]
+   ["`" "Backquote" false]
+   ["~" "Backquote" true]])
 
 (defn- expected-paired-value
   [input-char repeat-count]
@@ -411,6 +624,104 @@
       (is (empty? (:steps ime)))
       (is (empty? (:warnings english)))
       (is (empty? (:warnings ime))))))
+
+(deftest ime-composition-selected-text-wraping-parity-test
+  (doseq [[key code shift-key] ime-selected-text-wrapping-cases]
+    (testing (str "Selected text wrapping should match between english and IME for " key)
+      (let [english (english-autopair-with-selected-text-handler {:key key
+                                                                  :code code
+                                                                  :shift-key shift-key})
+            ime (ime-autopair-with-selected-text-handler {:input-char key
+                                                          :code code
+                                                          :shift-key shift-key})
+            expected (str key "Test" (get editor/autopair-map key))]
+        (is (= expected (:value english))
+            (str "English should wrap selected text\n"
+                 "expected-final=" (pr-str expected)
+                 "\nactual-final=" (pr-str (:value english))))
+        (is (= expected (:value ime))
+            (str "IME should wrap selected text\n"
+                 "expected-final=" (pr-str expected)
+                 "\nactual-final=" (pr-str (:value ime))))))))
+
+(deftest ime-composition-selected-text-opener-parity-test
+  (doseq [[key code shift-key] ime-selected-text-opener-cases]
+    (testing (str "Selected text opener autopair should match between english and IME for " key)
+      (let [english (english-autopair-with-selected-text-handler {:key key
+                                                                  :code code
+                                                                  :shift-key shift-key})
+            ime (ime-autopair-with-selected-text-handler {:input-char key
+                                                          :code code
+                                                          :shift-key shift-key})
+            expected (str key "Test" (get editor/autopair-map key))]
+        (is (= expected (:value english))
+            (str "English should keep selected text inside opener pair\n"
+                 "expected-final=" (pr-str expected)
+                 "\nactual-final=" (pr-str (:value english))))
+        (is (= expected (:value ime))
+            (str "IME should keep selected text inside opener pair\n"
+                 "expected-final=" (pr-str expected)
+                 "\nactual-final=" (pr-str (:value ime))))))))
+
+(deftest ime-composition-selected-text-left-paren-midword-parity-test
+  (testing "Selected text middle-of-word '(' should wrap in both english and IME"
+    (let [english (english-autopair-with-selected-text-handler {:value "abCDef"
+                                                                :selected-text "CD"
+                                                                :selection-start 2
+                                                                :key "("
+                                                                :code "Digit9"
+                                                                :shift-key true})
+          ime (ime-autopair-with-selected-text-handler {:value "abCDef"
+                                                        :selected-text "CD"
+                                                        :selection-start 2
+                                                        :input-char "("
+                                                        :code "Digit9"
+                                                        :shift-key true})
+          expected "ab(CD)ef"]
+      (is (= expected (:value english)))
+      (is (= expected (:value ime)))))
+  )
+
+(deftest ime-composition-selected-text-opener-side-effects-parity-test
+  (testing "Selected text [[ side effects should match between english and IME"
+    (let [english (english-autopair-with-selected-text-handler {:key "["
+                                                                :code "BracketLeft"
+                                                                :shift-key false
+                                                                :repeat-count 2})
+          ime (ime-autopair-with-selected-text-handler {:input-char "["
+                                                        :code "BracketLeft"
+                                                        :shift-key false
+                                                        :repeat-count 2})]
+      (is (= "[[Test]]" (:value english)))
+      (is (= "[[Test]]" (:value ime)))
+      (is (= [[:editor/search-page]] (:steps english)))
+      (is (= [] (:warnings english)))
+      (is (map? (:action-data english)))
+      (is (= (:steps english) (:steps ime)))
+      (is (= (:warnings english) (:warnings ime)))
+      (is (= (boolean (:action-data english))
+             (boolean (:action-data ime))))))
+
+  (testing "Selected text (( side effects should match between english and IME"
+    (let [english (english-autopair-with-selected-text-handler {:key "("
+                                                                :code "Digit9"
+                                                                :shift-key true
+                                                                :repeat-count 2})
+          ime (ime-autopair-with-selected-text-handler {:input-char "("
+                                                        :code "Digit9"
+                                                        :shift-key true
+                                                        :repeat-count 2})]
+      (is (= "((Test))" (:value english)))
+      (is (= "((Test))" (:value ime)))
+      (is (= [[:editor/search-block :reference]] (:steps english)))
+      (is (= 1 (count (:warnings english))))
+      (is (= [:warning] (first (:warnings english))))
+      (is (map? (:action-data english)))
+      (is (= (:steps english) (:steps ime)))
+      (is (= (:warnings english) (:warnings ime)))
+      (is (= (boolean (:action-data english))
+             (boolean (:action-data ime))))))
+  )
 
 (deftest extract-nearest-link-from-text-test
   (testing "Page, block and tag links"

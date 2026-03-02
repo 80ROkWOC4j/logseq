@@ -1506,9 +1506,19 @@
 
 (defn- set-ime-composition-start-context!
   [input-id input]
-  (swap! ime-composition-start-context
-         assoc input-id {:value (gobj/get input "value")
-                         :pos (cursor/pos input)}))
+  (let [value (or (gobj/get input "value") "")
+        selection-start (util/get-selection-start input)
+        selection-end (util/get-selection-end input)
+        selected (when (and (number? selection-start)
+                            (number? selection-end)
+                            (not= selection-start selection-end))
+                   (subs value selection-start selection-end))]
+    (swap! ime-composition-start-context
+           assoc input-id {:value value
+                           :pos (cursor/pos input)
+                           :selection-start selection-start
+                           :selection-end selection-end
+                           :selected selected})))
 
 (defn- take-ime-composition-start-context!
   [input-id]
@@ -1591,54 +1601,90 @@
         (= event-type "compositionend")
         (let [selected (util/get-selected-text)
               close-char (get autopair-map key)
-              start-context (take-ime-composition-start-context! input-id)]
+              start-context (take-ime-composition-start-context! input-id)
+              start-selected (or (:selected start-context) "")
+              selected* (if (string/blank? selected) start-selected selected)
+              selected-from-start? (and (not (string/blank? start-selected))
+                                        (number? (:selection-start start-context))
+                                        (number? (:selection-end start-context)))]
           (when (and (contains? ime-composition-autopair-openers key)
                      close-char
-                     (autopair-allowed? input key selected)
-                     (string/blank? selected))
+                     (or selected-from-start?
+                         (autopair-allowed? input key selected*)))
             (schedule-ime-autopair!
              (fn []
                (when-let [input (gdom/getElement input-id)]
-                 (let [pos (cursor/pos input)
-                       value (gobj/get input "value")
-                       curr (util/nth-safe value pos)
-                       opener-committed? (ime-opener-committed? value pos key start-context)]
-                   ;; Match english logic: if next char already equals '~', consume the just-committed '~' and move forward.
-                   (if (and opener-committed?
-                            (contains? (set/difference (set (keys reversed-autopair-map))
-                                                       #{"`"})
-                                       key)
-                            (= curr key))
-                     (let [value' (str (subs value 0 (dec pos))
-                                       (subs value pos))]
-                       (state/set-block-content-and-last-pos! input-id value' pos)
-                       (cursor/move-cursor-to input pos))
-                     (do
-                       (commands/simple-insert! input-id
-                                                (if opener-committed?
-                                                  close-char
-                                                  (str key close-char))
-                                                {:backward-pos 1})
-                       (let [value (gobj/get input "value")
-                             pos (cursor/pos input)
-                             prefix (get-autopair-side-effect-prefix value (- pos 2))]
-                         ;; Keep IME composition side effects aligned with keydown autopair.
-                         (cond
-                           (= prefix page-ref/left-brackets)
-                           (do
-                             (commands/handle-step [:editor/search-page])
-                             (state/set-editor-action-data! {:pos (cursor/get-caret-pos input)
-                                                             :selected selected}))
+                 (if selected-from-start?
+                   (let [value (or (:value start-context) "")
+                         start (:selection-start start-context)
+                         end (:selection-end start-context)
+                         before (subs value 0 start)
+                         after (subs value end)
+                         new-value (str before key start-selected close-char after)
+                         new-pos (inc start)
+                         selected-end (+ new-pos (count start-selected))
+                         prefix (get-autopair-side-effect-prefix new-value (dec start))]
+                     (state/set-block-content-and-last-pos! input-id new-value new-pos)
+                     (cursor/move-cursor-to input new-pos)
+                     (.setSelectionRange input new-pos selected-end)
+                     ;; Keep IME selected-text path side effects aligned with keydown autopair.
+                     (cond
+                       (= prefix page-ref/left-brackets)
+                       (do
+                         (commands/handle-step [:editor/search-page])
+                         (state/set-editor-action-data! {:pos (cursor/get-caret-pos input)
+                                                         :selected selected*}))
 
-                           (= prefix block-ref/left-parens)
-                           (do
-                             (show-node-reference-warning!)
-                             (commands/handle-step [:editor/search-block :reference])
-                             (state/set-editor-action-data! {:pos (cursor/get-caret-pos input)
-                                                             :selected selected}))
+                       (= prefix block-ref/left-parens)
+                       (do
+                         (show-node-reference-warning!)
+                         (commands/handle-step [:editor/search-block :reference])
+                         (state/set-editor-action-data! {:pos (cursor/get-caret-pos input)
+                                                         :selected selected*}))
 
-                           :else
-                           nil))))))))
+                       :else
+                       nil))
+                   (when (string/blank? (util/get-selected-text))
+                     (let [pos (cursor/pos input)
+                           value (gobj/get input "value")
+                           curr (util/nth-safe value pos)
+                           opener-committed? (ime-opener-committed? value pos key start-context)]
+                       ;; Match english logic: if next char already equals '~', consume the just-committed '~' and move forward.
+                       (if (and opener-committed?
+                                (contains? (set/difference (set (keys reversed-autopair-map))
+                                                           #{"`"})
+                                           key)
+                                (= curr key))
+                         (let [value' (str (subs value 0 (dec pos))
+                                           (subs value pos))]
+                           (state/set-block-content-and-last-pos! input-id value' pos)
+                           (cursor/move-cursor-to input pos))
+                         (do
+                           (commands/simple-insert! input-id
+                                                    (if opener-committed?
+                                                      close-char
+                                                      (str key close-char))
+                                                    {:backward-pos 1})
+                           (let [value (gobj/get input "value")
+                                 pos (cursor/pos input)
+                                 prefix (get-autopair-side-effect-prefix value (- pos 2))]
+                             ;; Keep IME composition side effects aligned with keydown autopair.
+                             (cond
+                               (= prefix page-ref/left-brackets)
+                               (do
+                                 (commands/handle-step [:editor/search-page])
+                                 (state/set-editor-action-data! {:pos (cursor/get-caret-pos input)
+                                                                 :selected selected*}))
+
+                               (= prefix block-ref/left-parens)
+                               (do
+                                 (show-node-reference-warning!)
+                                 (commands/handle-step [:editor/search-block :reference])
+                                 (state/set-editor-action-data! {:pos (cursor/get-caret-pos input)
+                                                                 :selected selected*}))
+
+                               :else
+                               nil))))))))))
             true))
 
         :else
@@ -2700,7 +2746,12 @@
         (and (util/goog-event-is-composing? e true) ;; #3218
              (not hashtag?) ;; #3283 @Rime
              (not (state/get-editor-show-page-search-hashtag?))) ;; #3283 @MacOS pinyin
-        nil
+        (do
+          (if (state/get-editor-action)
+            (swap! ime-composition-start-context dissoc input-id)
+            (when-not (string/blank? (util/get-selected-text))
+              (set-ime-composition-start-context! input-id input)))
+          nil)
 
         (or ctrlKey metaKey)
         nil
