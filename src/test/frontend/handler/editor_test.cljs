@@ -439,6 +439,74 @@
        :warnings @warnings*
        :action-data @action-data*})))
 
+(defn- ime-delayed-commit-unselected-handler
+  [{:keys [value cursor-pos input-char code shift-key]
+    :or {value "("
+         cursor-pos 1
+         input-char "("
+         code "Digit9"
+         shift-key true}}]
+  (let [value* (atom value)
+        pos* (atom cursor-pos)
+        input (js-obj "value" value
+                      "selectionStart" cursor-pos
+                      "selectionEnd" cursor-pos)]
+    (gobj/set input "setSelectionRange"
+              (fn [start end]
+                (set! (.-selectionStart input) start)
+                (set! (.-selectionEnd input) end)))
+    (state/set-editor-action! nil)
+    (with-redefs [state/get-edit-input-id (constantly "id")
+                  state/get-input (constantly input)
+                  gdom/getElement (constantly input)
+                  editor/ime-composition-start-context (atom {})
+                  cursor/pos (fn [_] @pos*)
+                  cursor/get-caret-pos (fn [_] {:pos @pos*})
+                  cursor/move-cursor-to (fn
+                                          ([_input n]
+                                           (reset! pos* n)
+                                           (.setSelectionRange input n n))
+                                          ([_input n _delay?]
+                                           (reset! pos* n)
+                                           (.setSelectionRange input n n)))
+                  util/get-selected-text (constantly "")
+                  util/goog-event-is-composing? (fn [_e include-process?]
+                                                  include-process?)
+                  state/get-editor-show-page-search-hashtag? (constantly false)
+                  commands/handle-step (fn [_step] nil)
+                  notification/show! (fn [_message _level] nil)
+                  state/set-editor-action-data! (fn [_m] nil)
+                  state/set-block-content-and-last-pos!
+                  (fn [_id next-value next-pos]
+                    (reset! value* next-value)
+                    (set! (.-value input) next-value)
+                    (reset! pos* next-pos)
+                    (.setSelectionRange input next-pos next-pos))
+                  editor/schedule-ime-autopair! (fn [f] (f))
+                  commands/simple-insert!
+                  (fn [_id text {:keys [backward-pos]}]
+                    (let [before (subs @value* 0 @pos*)
+                          after (subs @value* @pos*)
+                          next-value (str before text after)
+                          next-pos (- (+ @pos* (count text))
+                                      (or backward-pos 0))]
+                      (reset! value* next-value)
+                      (set! (.-value input) next-value)
+                      (reset! pos* next-pos)
+                      (.setSelectionRange input next-pos next-pos)))]
+      ;; Real app path for this bug: keydown Process happens without a selected range.
+      ((editor/keydown-not-matched-handler :markdown)
+       #js {:key "Process"
+            :code code
+            :shiftKey shift-key}
+       nil)
+      ;; Delayed-commit path: compositionend arrives before opener gets committed.
+      (#'editor/ime-composition-autopair! #js {:type "compositionend"
+                                               :data input-char}
+       "id")
+      {:value @value*
+       :pos @pos*})))
+
 (def ime-autopair-cases
   [["(" "(" "Digit9" true]
    ["{" "{" "BracketLeft" true]
@@ -681,6 +749,28 @@
       (is (= expected (:value english)))
       (is (= expected (:value ime)))))
   )
+
+(deftest ime-composition-unselected-delayed-commit-left-paren-parity-test
+  (testing "Unselected delayed-commit IME '(' should match english autopair after existing '('"
+    (let [english (keydown-not-matched-handler
+                   {:value "("
+                    :cursor-pos 1
+                    :events [#js {:key "("
+                                  :code "Digit9"
+                                  :shiftKey true}]
+                    :input-char "("})
+          ime (ime-delayed-commit-unselected-handler
+               {:value "("
+                :cursor-pos 1
+                :input-char "("
+                :code "Digit9"
+                :shift-key true})
+          expected "(()"]
+      (is (= expected (:value english)))
+      (is (= expected (:value ime))
+          (str "IME delayed-commit should match english autopair\n"
+               "expected-final=" (pr-str expected)
+               "\nactual-final=" (pr-str (:value ime)))))))
 
 (deftest ime-composition-selected-text-opener-side-effects-parity-test
   (testing "Selected text [[ side effects should match between english and IME"

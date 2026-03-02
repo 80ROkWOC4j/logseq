@@ -2749,8 +2749,7 @@
         (do
           (if (state/get-editor-action)
             (swap! ime-composition-start-context dissoc input-id)
-            (when-not (string/blank? (util/get-selected-text))
-              (set-ime-composition-start-context! input-id input)))
+            (set-ime-composition-start-context! input-id input))
           nil)
 
         (or ctrlKey metaKey)
